@@ -473,42 +473,82 @@ function checkAllAtRest() {
 
 /**
  * Advance the physics simulation by one fixed timestep `dt`.
- * Order of operations:
- *   1. Move all balls (integrate velocity).
- *   2. Resolve ball-ball collisions (multiple passes for stability).
+ * Uses substep iteration (anti-tunneling) to ensure no ball travels more
+ * than one ball-radius per substep, preventing high-speed pass-through.
+ *
+ * Order of operations per substep:
+ *   1. Move all balls (integrate velocity, subdivided).
+ *   2. Resolve ball-ball collisions (2 passes).
  *   3. Resolve ball-rail collisions.
  *   4. Check pocket captures.
- *   5. Apply friction.
+ *   5. Check out-of-bounds (treat as scratch).
+ * Friction is applied once per full step after all substeps.
  */
 function stepPhysics() {
   const activeBalls = balls.filter(b => !b.pocketed);
 
-  // 1. Integrate positions
+  // ── Anti-tunneling: compute required substep count ─────────
+  // Find the fastest ball's displacement per full step.
+  let maxDisp = 0;
   for (const ball of activeBalls) {
-    ball.x += ball.vx;
-    ball.y += ball.vy;
+    const disp = Math.hypot(ball.vx, ball.vy);
+    if (disp > maxDisp) maxDisp = disp;
   }
+  // Subdivide so that no ball moves more than BALL_RADIUS per substep.
+  const substeps = Math.max(1, Math.ceil(maxDisp / BALL_RADIUS));
+  const subDt = 1 / substeps; // fraction of full step per substep
 
-  // 2. Ball-ball collisions (2 passes to improve stability with many balls)
-  for (let pass = 0; pass < 2; pass++) {
-    for (let i = 0; i < activeBalls.length; i++) {
-      for (let j = i + 1; j < activeBalls.length; j++) {
-        detectAndResolveBallBall(activeBalls[i], activeBalls[j]);
+  for (let s = 0; s < substeps; s++) {
+    // 1. Integrate positions (scaled by substep fraction)
+    for (const ball of activeBalls) {
+      if (ball.pocketed) continue;
+      ball.x += ball.vx * subDt;
+      ball.y += ball.vy * subDt;
+    }
+
+    // 2. Ball-ball collisions (2 passes for stability)
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < activeBalls.length; i++) {
+        for (let j = i + 1; j < activeBalls.length; j++) {
+          if (!activeBalls[i].pocketed && !activeBalls[j].pocketed) {
+            detectAndResolveBallBall(activeBalls[i], activeBalls[j]);
+          }
+        }
+      }
+    }
+
+    // 3. Ball-rail collisions
+    for (const ball of activeBalls) {
+      if (!ball.pocketed) detectAndResolveBallRail(ball);
+    }
+
+    // 4. Pocket checks
+    for (const ball of activeBalls) {
+      if (!ball.pocketed) checkPocket(ball);
+    }
+
+    // 5. Out-of-bounds check (ball escaped table without entering a pocket)
+    for (const ball of activeBalls) {
+      if (ball.pocketed) continue;
+      const margin = BALL_RADIUS * 3; // generous buffer beyond which escape is certain
+      if (
+        ball.x < -margin || ball.x > TABLE_W + margin ||
+        ball.y < -margin || ball.y > TABLE_H + margin
+      ) {
+        // Treat as scratch / ball lost
+        ball.pocketed = true;
+        ball.vx = 0;
+        ball.vy = 0;
+        if (ball.id === 0) {
+          gs.cueBallPocketed = true;
+        } else {
+          gs.pocketedThisShot.push({ id: ball.id, timestamp: performance.now() });
+        }
       }
     }
   }
 
-  // 3. Ball-rail collisions
-  for (const ball of activeBalls) {
-    detectAndResolveBallRail(ball);
-  }
-
-  // 4. Pocket checks
-  for (const ball of activeBalls) {
-    checkPocket(ball);
-  }
-
-  // 5. Friction
+  // 5. Friction — applied once per full physics step
   for (const ball of activeBalls) {
     if (!ball.pocketed) applyFriction(ball);
   }
@@ -1149,14 +1189,10 @@ function onMouseUp(e) {
 
   if (gs.state === STATES.POWER_DRAG) {
     if (gs.power < 0.01) {
-      // No meaningful drag — cancel and return to aiming
-      gs.state = gs.state === STATES.AWAITING_BREAK ? STATES.AWAITING_BREAK : STATES.AIMING;
-      // Determine which aiming state to revert to
-      gs.state = (gs.breakingPlayer === gs.activePlayer &&
-                  gs.player1Pocketed.length === 0 &&
-                  gs.player2Pocketed.length === 0 &&
-                  !gs.groupAssigned)
-        ? STATES.AWAITING_BREAK : STATES.AIMING;
+      // No meaningful drag — cancel and return to the correct aiming state.
+      // Use the _wasBreakShot flag as the authoritative indicator: if it is
+      // still set, we are in the break phase and must revert to AWAITING_BREAK.
+      gs.state = gs._wasBreakShot ? STATES.AWAITING_BREAK : STATES.AIMING;
       gs.power = 0;
       gs.dragStartTable = null;
       updatePowerMeter(0);
@@ -1232,14 +1268,27 @@ function placeCueBall(x, y) {
   gs.bihValid = false;
 }
 
+/** Timer handle for the ball-in-hand invalid-flash animation. */
+let bihFlashTimer = null;
+
 /**
- * Briefly signal that the ball-in-hand placement was invalid.
- * (Visual flash is handled by drawBallInHandGhost via gs.bihValid already
- * being false; this hook can be extended to add a CSS shake animation.)
+ * Trigger a brief red-flash on the canvas by toggling a CSS class
+ * on the canvas element.  Uses the `flashRed` keyframe defined in styles.css.
+ * The ghost ball is already rendered red via gs.bihValid === false;
+ * this adds a border pulse on the canvas container for extra clarity.
  */
 function flashBihInvalid() {
-  // The ghost is already rendered red when bihValid === false.
-  // No additional action needed at this scaffold stage.
+  if (bihFlashTimer) {
+    clearTimeout(bihFlashTimer);
+    canvas.classList.remove('bih-flash');
+    // Force reflow so the animation restarts cleanly
+    void canvas.offsetWidth; // eslint-disable-line no-void
+  }
+  canvas.classList.add('bih-flash');
+  bihFlashTimer = setTimeout(() => {
+    canvas.classList.remove('bih-flash');
+    bihFlashTimer = null;
+  }, 350);
 }
 
 /** Recalculate screen→table mapping when the window is resized. */
@@ -1717,6 +1766,9 @@ function cacheDomRefs() {
   elGameoverReason = document.getElementById('gameover-reason');
   elStartBtn      = document.getElementById('start-btn');
   elPlayAgainBtn  = document.getElementById('play-again-btn');
+
+  // Foul banner is click-dismissible (spec: "auto-dismiss after 2 seconds or click-dismiss")
+  elFoulBanner.addEventListener('click', hideFoulBanner);
 }
 
 // ── updateHUD ────────────────────────────────────────────────

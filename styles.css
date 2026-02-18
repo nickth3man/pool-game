@@ -45,6 +45,7 @@ html, body {
   font-family: 'Segoe UI', system-ui, Arial, Helvetica, sans-serif;
   color: var(--text-primary);
   overflow: hidden;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -220,6 +221,7 @@ html, body {
   text-align: center;
   width: 100%;
   animation: fadeIn 0.2s ease;
+  cursor: pointer;
 }
 
 .foul-banner.hidden {
@@ -360,6 +362,12 @@ html, body {
 @keyframes flashRed {
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.3; }
+}
+
+/* Ball-in-hand invalid placement flash — applied via JS */
+#gameCanvas.bih-flash {
+  animation: flashRed 0.35s ease;
+  outline: 3px solid #ef4444;
 }
 
 /* ============================================================

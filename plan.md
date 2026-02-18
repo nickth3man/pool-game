@@ -1,234 +1,538 @@
----
-
-**Build a fully functional, browser-based 8-ball pool game delivered as three separate files: `index.html`, `styles.css`, and `game.js`. The game must be playable from break to finish with realistic physics, complete APA/BCA-standard 8-ball rule enforcement, and a polished visual experience. Every feature described below must be implemented — no stubs, no placeholders, no truncated output.**
+## Refined Implementation Plan: Browser-Based 8-Ball Pool
 
 ---
 
-### 🎱 Game Rules & Logic (Standard 8-Ball)
+### CRITICAL ADDITIONS & RESOLUTIONS
 
-**Players & Turns**
-- Two-player, turn-based local play on a single device. Display the active player (`Player 1` / `Player 2`) prominently in the HUD at all times with a clear visual distinction (e.g., glowing border, highlight color) so there is never ambiguity about whose turn it is.
-- Maintain an explicit **game state machine** with these states: `AWAITING_BREAK`, `AIMING`, `POWER_DRAG`, `SHOT_IN_PROGRESS`, `BALL_IN_HAND_PLACEMENT`, `EVALUATING_SHOT_RESULT`, `GAME_OVER`. Every input and physics event must be gated by the current state — e.g., mouse clicks during `SHOT_IN_PROGRESS` are ignored; aiming UI only renders during `AIMING`.
-
-**Break Shot**
-- The game begins with a standard **diamond rack** at the foot end of the table: 15 object balls arranged in a triangle with the apex ball on the foot spot, the 8-ball in the center of the third row, one solid and one stripe in each rear corner, and the remaining balls placed randomly in the remaining positions. Randomize the non-fixed positions on each new game.
-- The cue ball starts at the **head spot** (¼ table length from the head rail, centered laterally). Player 1 always breaks first.
-- On the break, the shooting player is **not yet assigned** solids or stripes. Group assignment is deferred until the first legal pocket after the break (see below).
-- **Break-specific rules**: At least four object balls must contact a cushion or a ball must be pocketed; otherwise it is an illegal break — re-rack and the same player breaks again. Enforce this.
-
-**Group Assignment**
-- Assignment occurs when the first object ball is **legally pocketed after the break** (this may be on the break shot itself or on a subsequent shot if nothing was pocketed on the break). The pocketing player receives the group of the pocketed ball (solids 1–7 or stripes 9–15). The opponent receives the other group.
-- If both a solid and a stripe are pocketed on the same legal shot that triggers assignment, assign the group of whichever ball entered a pocket first (track pocket-entry order during the shot). If truly simultaneous, assign the group with more balls pocketed; if still tied, assign solids to the breaking player.
-- Display each player's assigned group in the HUD immediately upon assignment (e.g., a colored label reading "Solids" or "Stripes" with a representative ball icon).
-
-**Turn Continuity & Passing**
-- A player's turn continues as long as they legally pocket at least one ball from their own assigned group on each shot.
-- The turn passes to the opponent upon: (a) no ball being pocketed, (b) pocketing only opponent's ball(s), or (c) committing any foul. If a player legally pockets their own ball(s) *and* an opponent's ball on the same shot, the turn still passes (opponent's ball pocketed = loss of turn, though the opponent's ball stays pocketed).
-- Before groups are assigned, any legally pocketed object ball continues the shooter's turn.
-
-**Foul Conditions (all of these must be enforced)**
-1. **Scratch**: Cue ball enters a pocket. Penalty: ball-in-hand for opponent anywhere on the table.
-2. **Wrong first contact**: The cue ball's first contact with an object ball is an opponent's ball, or the 8-ball (when the player has not yet cleared their group). Penalty: ball-in-hand. Track first-contact during collision resolution.
-3. **No rail after contact**: After the cue ball strikes a legal object ball, no ball (including the cue ball) contacts a cushion and no ball is pocketed. Penalty: ball-in-hand.
-4. **No contact at all**: The cue ball fails to hit any object ball. Penalty: ball-in-hand.
-5. **Pocketing the 8-ball early**: Pocketing the 8-ball before clearing all of one's assigned group balls is an **immediate loss** (not merely a foul).
-6. **Scratch on the 8-ball shot**: Pocketing the 8-ball on a shot where the cue ball also scratches is an **immediate loss**.
-
-When a foul occurs (except game-ending fouls), display a brief **foul notification** banner (auto-dismiss after 2 seconds or click-dismiss) stating the foul type, then transition to ball-in-hand for the opponent.
-
-**8-Ball Endgame**
-- Once a player has legally pocketed all 7 balls of their group, they **must** target the 8-ball on their subsequent shots. The first contact must be the 8-ball.
-- Legally pocketing the 8-ball wins the game.
-- Pocketing the 8-ball early or scratching while pocketing the 8-ball is a **loss**.
-
-**Game Over**
-- Display a result modal overlay: "Player X Wins!" with a **"Play Again"** button. Clicking "Play Again" re-racks, resets all state (scores, group assignments, turn order — alternate who breaks each game), and returns to `AWAITING_BREAK`.
+The original specification contains seven structural ambiguities that would cause implementation failures or rule-engine gaps. The refinements below are additive — they do not replace the original spec but resolve, clarify, and extend it.
 
 ---
 
-### 🎯 Physics Engine (2D Rigid-Body Simulation)
+## I. Shot Metadata System (Linchpin Addition)
 
-**General Requirements**
-- Implement a **custom physics engine in vanilla JavaScript**. Zero external libraries (no Matter.js, Box2D, p2.js, etc.).
-- All physics constants must be declared as named constants at the top of the physics section for easy tuning.
+The rule engine cannot function without per-shot instrumentation woven into the physics engine. Add an explicit `shotData` object, instantiated fresh at the moment `SHOT_IN_PROGRESS` begins, mutated by physics callbacks, and consumed by `evaluateShotResult()`.
 
-**Table & Ball Dimensions (Logical Coordinate System)**
-- Define a logical table playing surface of **1000 × 500 units** (interior felt dimensions, excluding rails). All positions, velocities, and radii operate in this coordinate space. The canvas renderer maps this to screen pixels.
-- Ball radius: **12 units**. Pocket capture radius: **22 units** (corner pockets) and **20 units** (side pockets). Cushion rebound boundary: the ball rebounds when its center is within one ball-radius of the rail edge.
-- Pocket center positions: four corners at `(cornerInset, cornerInset)`, `(1000−cornerInset, cornerInset)`, etc., with `cornerInset ≈ 8`; two side pockets at `(500, −2)` and `(500, 502)` (slightly beyond the rail to create a "mouth" effect). Tune insets so corner pockets feel tight and side pockets feel slightly narrower, matching real pool geometry.
+```js
+// Instantiated at shot start, before any physics steps run
+const shotData = {
+  firstContact: null,         // ball ID of first object ball the cue ball struck
+  firstContactIsLegal: false, // set after group assignment check
+  railContactAfterHit: false, // any ball (including cue) touched a rail after firstContact
+  pocketedOrder: [],          // [{ball, timestamp}] in strict pocketing order
+  cueBallPocketed: false,     // scratch flag
+  eightBallPocketed: false,   // 8-ball flag
+  breakCushionContacts: new Set() // tracks unique cushion contacts during break
+};
+```
 
-**Fixed Timestep Loop**
-- Use `requestAnimationFrame` for the render loop. Decouple physics from rendering using an **accumulator pattern** with a fixed timestep of `dt = 1/120 second`. Each render frame, consume the accumulated time in `dt`-sized physics steps, then render once. Cap the accumulator (e.g., max 8 steps per frame) to prevent spiral-of-death on slow devices.
+Physics engine must fire these callbacks:
 
-**Ball-to-Ball Collisions**
-- Detect collision when the distance between two ball centers ≤ 2 × ball radius.
-- Resolve using **2D elastic collision** equations for equal-mass particles:
-  - Compute the collision normal `n = normalize(posB − posA)`.
-  - Compute relative velocity `vRel = velA − velB`.
-  - Compute impulse scalar `j = dot(vRel, n)`. If `j > 0`, balls are separating — skip.
-  - Apply velocity exchange: `velA −= j × n`, `velB += j × n`.
-  - Apply a **coefficient of restitution** (e.g., `e = 0.96`) to the impulse to model slight energy loss.
-- **Positional correction**: After resolving velocity, separate overlapping balls by pushing each along the collision normal by half the overlap distance. This prevents balls from sinking into each other over successive frames.
+- **`onBallBallCollision(ballA, ballB)`**: If `ballA` is the cue ball and `shotData.firstContact === null`, set `shotData.firstContact = ballB.id`.
+- **`onBallCushionCollision(ball)`**: Set `shotData.railContactAfterHit = true` if `shotData.firstContact !== null`. During break state, add cushion ID to `breakCushionContacts`.
+- **`onBallPocketed(ball)`**: Push `{ ball, time: performance.now() }` to `shotData.pocketedOrder`. Set flags for cue ball and 8-ball.
 
-**Ball-to-Cushion Collisions**
-- A cushion collision occurs when a ball's center is within one ball-radius of any rail boundary.
-- Reflect the velocity component perpendicular to the rail, multiplied by a **rail restitution coefficient** (`e_rail ≈ 0.75`). Leave the parallel component unchanged (or apply a slight tangential friction factor of ~0.95).
-- Apply positional correction: clamp the ball center to exactly one ball-radius from the rail.
-- Handle **corner pocket entrances**: near pocket mouths, the cushion boundary "opens up." Balls approaching a pocket should not rebound off a phantom rail across the pocket opening. Define the cushion segments as line segments that terminate at the pocket mouths, not as a continuous rectangle.
-
-**Friction & Deceleration**
-- Each physics step, multiply each ball's velocity by a **rolling friction factor** (e.g., `0.991` per step at 120Hz). This produces a natural, gradual slowdown.
-- When a ball's speed drops below a **rest threshold** (e.g., `0.3 units/step`), snap its velocity to zero. This prevents indefinite micro-drift.
-- Tune friction so that a medium-power shot (roughly 50% power) propels the cue ball approximately ¾ of the table length before stopping.
-
-**Pocketing**
-- A ball is pocketed when its center enters any pocket's capture radius.
-- On pocketing: immediately remove the ball from the physics simulation, record it in the game state (which player's tray, or the 8-ball result), and trigger a brief visual effect (e.g., the ball shrinks/fades into the pocket over ~150ms).
-- If the cue ball is pocketed, flag a scratch foul.
-- Track the **order** in which balls are pocketed each shot (needed for group assignment logic).
-
-**Anti-Tunneling**
-- At high velocities, a ball could skip over another ball or a rail in a single timestep. Mitigate this with **substep iteration**: if any ball's displacement in a single `dt` exceeds one ball-radius, subdivide that step into smaller increments (e.g., halve `dt` and double iterations) until displacement per substep < ball radius.
-
-**Shot Settlement Detection**
-- After a shot, the physics loop continues until **all balls have velocity magnitude below the rest threshold** for at least 5 consecutive physics steps. Only then transition the game state to `EVALUATING_SHOT_RESULT` (which applies rule logic) and then to the next player's `AIMING` or `BALL_IN_HAND_PLACEMENT` state.
+This must be physically in the collision resolution functions, not post-hoc. No rule check is possible without it.
 
 ---
 
-### 🖱️ Player Controls & Interaction
+## II. Fixed Timestep + Anti-Tunneling Integration
 
-**Aiming (state: `AIMING`)**
-- When all balls are at rest and it is the current player's turn, render a **cue stick** that pivots around the cue ball. The stick's angle follows the mouse cursor position relative to the cue ball center. The shot direction is the vector from the cue ball toward the mouse.
-- Draw a **dotted aiming guideline** (white, semi-transparent) from the cue ball center in the shot direction. The guideline extends until it hits:
-  - An **object ball**: Draw the line to the contact point. At the contact point, render a **ghost ball** (semi-transparent circle at the position where the cue ball's center would be at the moment of impact). From the ghost ball, draw a short **deflection indicator** (a solid line, ~40 units long) showing the predicted path of the target ball post-impact (along the collision normal from ghost-ball center to target-ball center). Also draw a short indicator from the ghost ball showing the cue ball's predicted deflection direction (tangent line). Both indicators should be visually distinct (different dash patterns or colors).
-  - A **cushion**: Draw the line to the rail contact point. Optionally show a reflected continuation line (dimmer) to help with bank-shot aiming.
-- The guideline should **not** pass through balls. It terminates at the first obstacle.
-- Limit the guideline maximum length to ~600 units (roughly half the table plus some) to prevent unrealistic full-table laser aiming.
+The original spec describes these as separate systems. They must be unified as follows to maintain temporal consistency across all balls in the same physics step:
 
-**Power Control (state: `POWER_DRAG`)**
-- The player **clicks** (mousedown) on or near the cue ball area to begin a power drag. On mousedown, transition to `POWER_DRAG` state.
-- The player **drags backward** (away from the shot direction) to increase power. Map the drag distance to a power value from 0% to 100%.
-- Display a **power meter bar** in the HUD that fills proportionally: green (0–33%), yellow (34–66%), red (67–100%).
-- The **cue stick** visually pulls back from the cue ball proportionally to the power level during the drag, giving tactile feedback.
-- On **mouseup** (release), execute the shot:
-  1. Animate the cue stick thrusting forward toward the cue ball over ~80ms.
-  2. Apply the velocity vector to the cue ball: direction = shot direction, magnitude = `power × MAX_SHOT_SPEED` (tune `MAX_SHOT_SPEED` so that 100% power launches the cue ball fast enough to scatter a full rack but not so fast that tunneling becomes unmanageable — around 25–30 units/step).
-  3. Transition to `SHOT_IN_PROGRESS`. Hide the cue stick and aiming UI.
-- If the player drags to 0% power (or clicks without dragging), do **not** execute a shot — return to `AIMING`.
+```js
+function physicsStep(dt) {
+  // 1. Compute global max displacement this step
+  const maxSpeed = Math.max(...balls.map(b => magnitude(b.vel)));
+  const rawDisp = maxSpeed * dt;
 
-**Ball-in-Hand Placement (state: `BALL_IN_HAND_PLACEMENT`)**
-- After a scratch foul, the incoming player must place the cue ball before shooting.
-- Render a **translucent ghost cue ball** that follows the mouse cursor over the table surface.
-- On click, validate the placement: the cue ball center must be at least 2 × ball-radius from every other ball's center (no overlap). If valid, place the cue ball and transition to `AIMING`. If invalid, flash the ghost ball red briefly and reject the placement.
-- The placement area is the **entire table** (open table ball-in-hand, not behind-the-head-string, per most bar/league rules).
+  // 2. Subdivide dt globally (NOT per-ball) if tunneling risk
+  const subSteps = rawDisp > BALL_RADIUS
+    ? Math.ceil(rawDisp / BALL_RADIUS)
+    : 1;
+  const subDt = dt / subSteps;
 
-**Mouse Coordinate Mapping**
-- All mouse events must be translated from screen (CSS pixel) coordinates to the logical table coordinate system, accounting for canvas scaling, offset, and aspect-ratio preservation. Provide a utility function `screenToTable(clientX, clientY)` that handles this reliably.
+  // 3. All balls advance through identical sub-steps
+  for (let s = 0; s < subSteps; s++) {
+    applyFriction(subDt);
+    resolveAllBallBallCollisions();
+    resolveAllBallCushionCollisions();
+    checkAllPockets();
+  }
+}
+```
 
----
+All balls must use the same `subDt` per step. Per-ball adaptive sub-stepping is prohibited — it creates temporal desync between balls and makes cross-ball collision detection undefined.
 
-### 🎨 Visual Design & Layout
-
-**Canvas Rendering**
-- Use a single **HTML5 `<canvas>`** element for all game-surface rendering: table felt, rails, pockets, pocket mouths, diamond sights, balls, cue stick, aiming guideline, ghost ball projections, and ball-in-hand ghost.
-- Set a logical (backing) canvas resolution of **1200 × 680** pixels (table surface plus outer rail border area). The playable felt area sits centered within this, with ~40px of rail/wood border on each side.
-- Use `ctx.save()` / `ctx.restore()` and coordinate transforms to separate table-space drawing from screen-space drawing.
-
-**Canvas Responsiveness**
-- CSS scales the canvas to fit the viewport width with `max-width: 1200px` and `width: 100%`, preserving aspect ratio via the `aspect-ratio` CSS property or a proportional padding trick. The canvas's internal resolution stays fixed; only its display size changes.
-- Recalculate the screen-to-table coordinate mapping on `window.resize`.
-
-**Table Appearance**
-- **Felt**: Rich green fill (`#0a7e3d`).
-- **Rails/cushions**: A slightly darker green inner strip (to suggest cushion rubber), bordered by dark wood-brown outer rails (`#4a2a0a`). Add a subtle 1px highlight along the top edge of the rails for a 3D bevel effect.
-- **Pockets**: Black filled circles positioned at the six standard locations. Render a slightly larger dark gray "mouth" ring behind each pocket to suggest the pocket opening and leather net.
-- **Diamond sights**: Small white or ivory dots along each rail at the standard 7 positions per long rail and 3 per short rail.
-- **Foot spot**: A small dot on the felt where the apex ball racks.
-- **Head string** (optional visual): A faint dotted line at the head-quarter of the table.
-
-**Ball Rendering**
-- Each ball is a filled circle with a high-quality appearance:
-  - **Solid balls (1–7)**: Fully filled with the ball's color. Colors: 1 Yellow (`#FFC000`), 2 Blue (`#003DA5`), 3 Red (`#CE1126`), 4 Purple (`#4B0082`), 5 Orange (`#FF6600`), 6 Green (`#006B3F`), 7 Maroon (`#800000`).
-  - **Stripe balls (9–15)**: White base with a **horizontal color band** (stripe) across the center third of the ball. Same color mapping as their solid counterpart (9 = Yellow stripe, 10 = Blue stripe, etc.).
-  - **8-ball**: Black fill, white "8".
-  - **Cue ball**: White fill, no number. Optionally a very faint off-white inner circle for depth.
-- Render the **ball number** (white text on dark balls, black text on light balls) centered on each ball, appropriately sized (roughly 60% of ball diameter). Use a bold sans-serif font.
-- Add a subtle **shadow** beneath each ball (a small, semi-transparent dark ellipse offset slightly down-right) to create depth.
-- Add a small **specular highlight** (a tiny white arc or dot at the upper-left of each ball) to suggest a light source and shininess.
-
-**Cue Stick Rendering**
-- A tapered line (thick at the butt, thin at the tip) rendered from behind the cue ball through and past it. Color: wood brown with a lighter tip.
-- During `POWER_DRAG`, the stick pulls back; the tip retracts away from the cue ball proportionally to power.
-- During the strike animation, the stick thrusts forward quickly and then is hidden.
-
-**HUD (HTML/CSS overlay, not on canvas)**
-- Positioned above or below the canvas (not overlapping the playing surface).
-- Elements:
-  - **Current player indicator**: "Player 1's Turn" / "Player 2's Turn" with a distinct background color for each player.
-  - **Group labels**: After assignment, display "Solids" or "Stripes" next to each player name with a representative ball color swatch.
-  - **Pocketed ball trays**: Two rows (one per player), each displaying the balls that player has pocketed as small colored circles (~20px), rendered in HTML/CSS (or small canvases). These fill in as balls are pocketed.
-  - **Power meter**: A horizontal bar (width ~200px, height ~16px) with a colored fill that responds in real-time during `POWER_DRAG`. Empty when not dragging.
-  - **Foul / info banners**: A dismissible/auto-dismissing message area for foul notifications, group assignment announcements, and game status.
-
-**Modals**
-- **Game Start Modal**: Shown on initial load. Text: "8-Ball" title, brief instruction ("Player 1 breaks. Click and drag to shoot."), and a "Start Game" button. Dismiss on button click → transition to `AIMING` with Player 1 to break.
-- **Foul Modal/Banner**: Brief overlay or banner (not a blocking modal). Shows foul type, auto-dismisses after 2 seconds.
-- **Game Over Modal**: Centered overlay with a semi-transparent backdrop. "Player X Wins!" message, optionally the reason (e.g., "legally pocketed the 8-ball" / "opponent sank the 8-ball early"), and a "Play Again" button.
-- All modals should have a smooth fade-in animation (CSS transition, ~200ms).
+The outer accumulator loop remains unchanged (consume wall time in `1/120s` chunks, max 8 steps per frame).
 
 ---
 
-### 🏗️ File Architecture
+## III. Cushion Segments (Not a Rectangle)
 
-**`index.html`**
-- Semantic HTML5 structure.
-- Contains: `<canvas id="gameCanvas">`, HUD container divs (player info, power meter, pocketed ball trays), modal container divs.
-- Links `styles.css` in `<head>` and `game.js` via `<script src="game.js" defer></script>` before `</body>`.
-- No inline styles. No inline JavaScript. No CDN links. No external resources.
+Replace the naive bounding-box collision check with six explicit line segments. This is the only way to correctly model pocket openings.
 
-**`styles.css`**
-- All visual styling: page layout (flexbox centering), canvas container sizing, HUD layout and typography, modal styling (positioning, backdrop, fade animations), power meter appearance, pocketed-ball tray layout, current-player highlighting, foul banner styling.
-- Use **CSS custom properties** for the color palette (e.g., `--felt-green`, `--rail-brown`, `--player1-color`, `--player2-color`) to enable easy theming.
-- Include a `:root` block with all variables, sensible resets (`box-sizing: border-box`, margin/padding resets), and responsive breakpoints if needed.
+```js
+// Each cushion is a line segment with a normal direction.
+// Endpoints terminate at pocket mouth edges, not at corners.
+// PML = pocket mouth left offset, PMR = pocket mouth right offset
+// from pocket center — tune so rail "opens" convincingly (~18 units)
 
-**`game.js`**
-- All game logic, physics, rendering, input handling, and state management. Organized into clearly commented sections or IIFEs/objects:
-  1. **Constants & Configuration**: Table dimensions, ball radius, pocket positions, physics tuning constants, color mappings, max shot speed.
-  2. **Game State Manager**: Current state (state machine), active player, group assignments, pocketed balls per player, foul flags, shot metadata (first contact, balls pocketed this shot, rails contacted).
-  3. **Physics Engine**: Ball update loop, ball-ball collision detection and resolution, ball-rail collision, pocket detection, friction application, rest detection, anti-tunneling substeps.
-  4. **Rendering**: `drawTable()`, `drawBalls()`, `drawCueStick()`, `drawAimingLine()`, `drawGhostBall()`, `drawBallInHandGhost()`. Each as a distinct function.
-  5. **Input Handler**: `mousemove`, `mousedown`, `mouseup` listeners on the canvas. Coordinate translation. State-aware input gating.
-  6. **Rule Engine**: `evaluateShotResult()` — called when all balls settle. Checks fouls, pocketing results, group assignment, turn continuation, win/loss conditions. Returns the next game state and active player.
-  7. **UI Manager**: Functions to update the HUD (player indicator, group labels, pocketed ball trays, power meter), show/hide modals, display foul notifications.
-  8. **Main Loop**: `requestAnimationFrame` callback, accumulator-based fixed timestep physics, render call.
-  9. **Initialization**: `initGame()` sets up the rack, places the cue ball, resets state, attaches event listeners, shows the start modal.
+const CUSHION_SEGMENTS = [
+  // Top rail (y=0), two segments split by top-side pocket
+  { x1: CORNER_PML, y1: 0, x2: SIDE_PMLeft,  y2: 0, normal: {x:0, y:1}  },
+  { x1: SIDE_PMRight, y1: 0, x2: 1000-CORNER_PMR, y2: 0, normal: {x:0, y:1} },
+  // Bottom rail (y=500), two segments
+  { x1: CORNER_PML, y1: 500, x2: SIDE_PMLeft, y2: 500, normal: {x:0, y:-1} },
+  { x1: SIDE_PMRight, y1: 500, x2: 1000-CORNER_PMR, y2: 500, normal: {x:0, y:-1} },
+  // Left rail (x=0), one segment
+  { x1: 0, y1: CORNER_PMT, x2: 0, y2: 500-CORNER_PMB, normal: {x:1, y:0} },
+  // Right rail (x=1000), one segment
+  { x1: 1000, y1: CORNER_PMT, x2: 1000, y2: 500-CORNER_PMB, normal: {x:-1, y:0} },
+];
+```
 
----
+Ball-cushion collision: for each segment, find the closest point on the segment to the ball center. If distance < `BALL_RADIUS`, reflect the velocity component along the segment's normal and apply positional correction. Corner pocket gaps are naturally open because no segment spans them.
 
-### ⚙️ Technical Constraints
-
-- **Vanilla JavaScript only**. Zero external dependencies — no frameworks (React, Vue), no libraries (jQuery, p5.js, Matter.js, Howler.js), no build tools (Webpack, Vite), no TypeScript, no npm packages. The three files must work by opening `index.html` in any modern browser via `file://` or a local server.
-- **No ES module `import`/`export` between files**. All JS in a single `game.js` file loaded with `<script defer>`.
-- **Performance**: Maintain 60fps with 16 balls in simultaneous motion. Use efficient collision detection (e.g., early-out distance checks before full resolution). Minimize canvas draw calls (batch similar operations, avoid unnecessary `save`/`restore` pairs in tight loops).
-- **Browser compatibility**: Must work in current versions of Chrome, Firefox, Safari, and Edge. Use only widely supported Canvas 2D API methods and standard DOM APIs. No experimental features.
-- **No sound required** (audio is explicitly out of scope to keep the implementation focused; do not include placeholder audio code).
-- The game must be **completely playable end-to-end**: load page → start → break → group assignment → take turns → clear group → pocket 8-ball → win screen → play again → repeat. Every rule, every interaction, every visual element described above must function. Deliver complete code with no truncation, no `// TODO`, no `// implement later`, no ellipsis-abbreviated sections.
+`CORNER_PML / PMR / PMT / PMB` ≈ 28 units from each corner. `SIDE_PMLeft / PMRight` ≈ 488 / 512 (±12 from pocket center at 500). Tune visually.
 
 ---
 
-### 🧪 Edge Cases to Handle Explicitly
+## IV. Power Drag — Directional Lock Clarification
 
-1. **8-ball pocketed on the break**: Not a loss. Re-spot the 8-ball on the foot spot (or nearest available position if the foot spot is occupied). The breaking player's turn continues (or ends normally if no other ball was pocketed).
-2. **Cue ball pocketed on the break (scratch on break)**: Incoming player gets ball-in-hand. No group assignment occurs if no other ball was legally pocketed.
-3. **Both a solid and stripe pocketed on the same assignment-triggering shot**: Assign based on first-pocketed or majority rule (as specified in Group Assignment section above).
-4. **Simultaneous 8-ball pocket + scratch**: Shooting player loses.
-5. **8-ball pocketed early (before group is cleared)**: Shooting player loses immediately.
-6. **Ball resting on pocket lip**: Any ball whose center enters the pocket capture radius is pocketed — do not allow balls to "hang" on the edge indefinitely. If a ball is nearly in but outside the radius, it stays in play (this is correct and realistic).
-7. **Cue ball frozen against another ball**: The player must still be able to aim freely (the aiming system uses angle-from-cue-ball, which works regardless of adjacent balls). The shot is legal as long as the contacted ball moves or any ball contacts a rail.
-8. **All object balls pocketed except the 8-ball**: The current player (whose group is now fully cleared) transitions to the 8-ball phase. The opponent also transitions if their group is cleared. Handle both players being in the 8-ball phase simultaneously.
-9. **Illegal break (fewer than 4 balls reach a cushion and nothing is pocketed)**: Re-rack and re-break with the same player. Display a brief notification.
-10. **Cue ball launched off the table (extreme edge case)**: If the cue ball's position ever exits the playing surface bounds without entering a pocket, treat it as a scratch (ball-in-hand for opponent).
+The shot direction is established at `mousedown` and locked. Do not re-track the mouse for direction during `POWER_DRAG`. Power is derived from drag distance only.
+
+```js
+// On mousedown (in AIMING state, near cue ball):
+shotState.aimAngle = Math.atan2(
+  tableMouseY - cueBall.y,
+  tableMouseX - cueBall.x
+);
+shotState.dragOrigin = { x: tableMouseX, y: tableMouseY };
+// Transition to POWER_DRAG
+
+// On mousemove (in POWER_DRAG):
+// Project mouse displacement onto the OPPOSITE of aimAngle
+const dx = tableMouseX - shotState.dragOrigin.x;
+const dy = tableMouseY - shotState.dragOrigin.y;
+const backVec = { x: -Math.cos(shotState.aimAngle), y: -Math.sin(shotState.aimAngle) };
+const rawPower = Math.max(0, dx * backVec.x + dy * backVec.y);
+shotState.power = Math.min(1.0, rawPower / MAX_DRAG_DISTANCE); // MAX_DRAG_DISTANCE ≈ 120 units
+
+// On mouseup:
+if (shotState.power < 0.01) {
+  // No shot — return to AIMING
+} else {
+  // Fire shot
+}
+```
 
 ---
 
-*Deliver all three complete files — `index.html`, `styles.css`, and `game.js` — with no truncation and no omitted sections. Every function, every rule, every visual element, and every interaction described in this specification must be fully implemented and operational in the delivered code.*
+## V. Foul Evaluation Order in `evaluateShotResult()`
+
+Execute checks in this exact sequence to prevent rule conflicts:
+
+```
+1. Is GAME_OVER already? → return, do nothing.
+
+2. Was the 8-ball pocketed?
+   a. Was cue ball also pocketed (simultaneous)?  → CURRENT PLAYER LOSES.
+   b. Has current player cleared their group?
+      - Yes → CURRENT PLAYER WINS.
+      - No  → CURRENT PLAYER LOSES (early 8-ball).
+
+3. Foul checks (in priority order):
+   a. Cue ball pocketed (scratch)?       → foul: BALL_IN_HAND
+   b. No contact at all?                 → foul: BALL_IN_HAND
+   c. Wrong first contact?               → foul: BALL_IN_HAND
+   d. No rail contact after legal hit    → foul: BALL_IN_HAND
+   (If any foul → show banner, pass turn, goto BALL_IN_HAND_PLACEMENT)
+
+4. Group assignment (if not yet assigned):
+   - Any ball pocketed this shot?
+     - Yes → apply group assignment logic (first-pocketed order)
+     - No  → no assignment yet
+
+5. Turn continuation:
+   - Any ball pocketed from current player's group (or any ball if unassigned)?
+     - Yes + no opponent balls pocketed → SAME player, AIMING
+     - Yes + opponent ball also pocketed → PASS TURN, AIMING
+     - No balls of own group pocketed   → PASS TURN, AIMING
+
+6. Transition to next state.
+```
+
+---
+
+## VI. Break Validation — Explicit Algorithm
+
+```js
+function validateBreak(shotData) {
+  const ballsPocketed = shotData.pocketedOrder.length > 0;
+  const cushionsHit = shotData.breakCushionContacts.size;
+
+  // 8-ball pocketed on break: re-spot, continue (not a loss)
+  if (shotData.eightBallPocketed) {
+    respotEightBall();
+    // Remove 8-ball from pocketedOrder for group assignment purposes
+  }
+
+  // Cue ball pocketed on break: scratch, ball-in-hand, no group assignment
+  if (shotData.cueBallPocketed) {
+    return { legal: true, foul: 'SCRATCH', transition: 'BALL_IN_HAND' };
+  }
+
+  // Illegal break: < 4 cushion contacts AND nothing pocketed
+  const objectBallsPocketed = shotData.pocketedOrder
+    .filter(e => e.ball.id !== 'cue' && e.ball.id !== 8).length;
+
+  if (cushionsHit < 4 && objectBallsPocketed === 0) {
+    return { legal: false, foul: 'ILLEGAL_BREAK', transition: 'RERACK' };
+  }
+
+  return { legal: true, foul: null };
+}
+```
+
+Count unique cushion IDs (top, bottom, left, right = 4 maximum possible). Use segment IDs as the deduplication key.
+
+---
+
+## VII. 8-Ball Re-spot Algorithm
+
+```js
+function respotEightBall() {
+  const footSpot = { x: 750, y: 250 }; // 3/4 table length, centered
+  const candidates = [
+    footSpot,
+    { x: 750, y: 226 },  // one ball diameter above
+    { x: 750, y: 274 },  // one ball diameter below
+    { x: 726, y: 250 },
+    { x: 774, y: 250 },
+    // spiral outward as needed
+  ];
+  for (const pos of candidates) {
+    if (isPositionClear(pos, balls, BALL_RADIUS * 2 + 2)) {
+      eightBall.x = pos.x;
+      eightBall.y = pos.y;
+      eightBall.vel = { x: 0, y: 0 };
+      balls.push(eightBall); // re-add to simulation
+      return;
+    }
+  }
+  // If all candidates occupied (extremely rare), place at head spot
+  eightBall.x = 250; eightBall.y = 250;
+  balls.push(eightBall);
+}
+```
+
+---
+
+## VIII. Canvas Device Pixel Ratio Handling
+
+```js
+function initCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const LOGICAL_W = 1200, LOGICAL_H = 680;
+
+  canvas.width = LOGICAL_W * dpr;
+  canvas.height = LOGICAL_H * dpr;
+  canvas.style.width = LOGICAL_W + 'px';
+  canvas.style.height = LOGICAL_H + 'px';
+  ctx.scale(dpr, dpr);
+  // All drawing now uses logical 1200×680 coordinates
+}
+
+function screenToTable(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  // CSS display size may differ from logical size due to responsive scaling
+  const scaleX = 1200 / rect.width;
+  const scaleY = 680 / rect.height;
+  const logicalX = (clientX - rect.left) * scaleX;
+  const logicalY = (clientY - rect.top) * scaleY;
+  // Convert from canvas-space to table-space
+  // Table felt starts at TABLE_OFFSET_X, TABLE_OFFSET_Y within the 1200×680 canvas
+  return {
+    x: (logicalX - TABLE_OFFSET_X) * (TABLE_W / FELT_W),
+    y: (logicalY - TABLE_OFFSET_Y) * (TABLE_H / FELT_H)
+  };
+}
+```
+
+Call `initCanvas()` on load and again on `window.resize`, resetting `dpr` and re-scaling. Do not retain a stale `dpr` reference.
+
+---
+
+## IX. State Machine Transition Table (Explicit)
+
+| From State | Event | Condition | To State |
+|---|---|---|---|
+| `AWAITING_BREAK` | Start button clicked | — | `AIMING` |
+| `AIMING` | `mousedown` near cue ball | — | `POWER_DRAG` |
+| `POWER_DRAG` | `mouseup`, power ≥ 1% | — | `SHOT_IN_PROGRESS` |
+| `POWER_DRAG` | `mouseup`, power < 1% | — | `AIMING` |
+| `SHOT_IN_PROGRESS` | All balls at rest ≥5 steps | — | `EVALUATING_SHOT_RESULT` |
+| `EVALUATING_SHOT_RESULT` | Rules evaluated | Win condition | `GAME_OVER` |
+| `EVALUATING_SHOT_RESULT` | Rules evaluated | Foul | `BALL_IN_HAND_PLACEMENT` |
+| `EVALUATING_SHOT_RESULT` | Rules evaluated | Legal, same player | `AIMING` |
+| `EVALUATING_SHOT_RESULT` | Rules evaluated | Legal, turn passes | `AIMING` (opponent) |
+| `EVALUATING_SHOT_RESULT` | Rules evaluated | Illegal break | `AWAITING_BREAK` (same player) |
+| `BALL_IN_HAND_PLACEMENT` | Valid click | Placement legal | `AIMING` |
+| `GAME_OVER` | Play Again clicked | — | `AWAITING_BREAK` |
+
+All mouse events not listed for a given state are **silently ignored** in the handler via early-return guard.
+
+---
+
+## X. Constants Block — Complete Reference
+
+```js
+// ─── TABLE ───────────────────────────────────────────────────────────────────
+const TABLE_W         = 1000;    // logical felt width (units)
+const TABLE_H         = 500;     // logical felt height (units)
+const CANVAS_W        = 1200;    // full canvas logical width
+const CANVAS_H        = 680;     // full canvas logical height
+const TABLE_OFFSET_X  = 100;     // canvas-space left edge of felt
+const TABLE_OFFSET_Y  = 90;      // canvas-space top edge of felt
+
+// ─── BALLS ───────────────────────────────────────────────────────────────────
+const BALL_RADIUS     = 12;
+const POCKET_RADIUS_CORNER = 22;
+const POCKET_RADIUS_SIDE   = 20;
+const CORNER_INSET    = 8;       // pocket center offset from corner
+
+// ─── PHYSICS ─────────────────────────────────────────────────────────────────
+const FIXED_DT        = 1 / 120;
+const MAX_STEPS       = 8;
+const FRICTION        = 0.991;   // per physics step at 120Hz
+const REST_THRESHOLD  = 0.3;     // units/step — snap to zero below this
+const REST_STEPS_REQ  = 5;       // consecutive steps all-at-rest before settle
+const RESTITUTION     = 0.96;    // ball-ball coefficient of restitution
+const RAIL_RESTITUTION= 0.75;    // ball-rail perpendicular restitution
+const RAIL_FRICTION   = 0.95;    // ball-rail tangential retention factor
+
+// ─── SHOT ────────────────────────────────────────────────────────────────────
+const MAX_SHOT_SPEED  = 28;      // units/step at 100% power
+const MAX_DRAG_DIST   = 120;     // logical table units for full power drag
+
+// ─── RACK ────────────────────────────────────────────────────────────────────
+const FOOT_SPOT       = { x: 750, y: 250 };
+const HEAD_SPOT       = { x: 250, y: 250 };
+const BALL_SPACING    = BALL_RADIUS * 2 * 1.02; // slight gap to prevent overlap at start
+
+// ─── AIMING ──────────────────────────────────────────────────────────────────
+const AIM_LINE_MAX_LEN = 600;    // maximum guideline length in table units
+const DEFLECT_LINE_LEN = 40;     // object-ball and cue-ball deflection indicators
+```
+
+---
+
+## XI. Rack Positions — Explicit Grid
+
+Rack rows from apex (row 1) to base (row 5), apex at `FOOT_SPOT`:
+
+```js
+function buildRackPositions() {
+  const rows = [1, 2, 3, 4, 5];
+  const positions = [];
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col <= row; col++) {
+      positions.push({
+        x: FOOT_SPOT.x + row * BALL_SPACING * Math.cos(Math.PI / 6),
+        y: FOOT_SPOT.y + (col - row / 2) * BALL_SPACING
+      });
+    }
+  });
+  // positions[0]  = apex (row 1, col 0)   → any ball except 8
+  // positions[4]  = row 3, col 1 (center) → 8-ball FIXED
+  // positions[12] = row 5, col 0 (rear-left corner)  → one solid FIXED
+  // positions[14] = row 5, col 4 (rear-right corner) → one stripe FIXED
+  // All remaining positions: shuffle from remaining balls
+  return positions;
+}
+```
+
+Row 3 center index = `1 + 2 + 1 = position[4]` (0-indexed: apex=0, row2=[1,2], row3=[3,4,5], center of row3=4). Confirm this is the 5th position (0-indexed: 4). ✓
+
+---
+
+## XII. Group Assignment — Precise Logic
+
+```js
+function resolveGroupAssignment(pocketedOrder, breakingPlayerId, currentPlayerId) {
+  // Filter to object balls only (not cue, not 8-ball which was re-spotted)
+  const objects = pocketedOrder.filter(e => e.ball.id !== 'cue' && e.ball.id !== 8);
+  if (objects.length === 0) return; // no assignment
+
+  const solids  = objects.filter(e => e.ball.id >= 1 && e.ball.id <= 7);
+  const stripes = objects.filter(e => e.ball.id >= 9 && e.ball.id <= 15);
+
+  let currentPlayerGroup;
+  if (solids.length > 0 && stripes.length === 0) {
+    currentPlayerGroup = 'solids';
+  } else if (stripes.length > 0 && solids.length === 0) {
+    currentPlayerGroup = 'stripes';
+  } else {
+    // Both types pocketed on same shot
+    const firstSolid  = solids[0]?.time  ?? Infinity;
+    const firstStripe = stripes[0]?.time ?? Infinity;
+    if (firstSolid < firstStripe) {
+      currentPlayerGroup = 'solids';
+    } else if (firstStripe < firstSolid) {
+      currentPlayerGroup = 'stripes';
+    } else {
+      // Truly simultaneous (same ms timestamp)
+      if (solids.length > stripes.length) currentPlayerGroup = 'solids';
+      else if (stripes.length > solids.length) currentPlayerGroup = 'stripes';
+      else currentPlayerGroup = (currentPlayerId === breakingPlayerId) ? 'solids' : 'stripes';
+    }
+  }
+
+  gameState.groups[currentPlayerId]  = currentPlayerGroup;
+  gameState.groups[opponentOf(currentPlayerId)] =
+    currentPlayerGroup === 'solids' ? 'stripes' : 'solids';
+}
+```
+
+---
+
+## XIII. Aiming Line — Ray-Cast Algorithm
+
+```js
+function castAimRay(origin, angle, balls, maxLen) {
+  const dir = { x: Math.cos(angle), y: Math.sin(angle) };
+  let closest = { dist: maxLen, type: null, point: null, ball: null };
+
+  // 1. Check each object ball (sweep-sphere intersection)
+  for (const ball of balls) {
+    if (ball === cueBall || ball.pocketed) continue;
+    // Find t where |origin + t*dir - ball.pos| = 2*BALL_RADIUS
+    const toball = { x: ball.x - origin.x, y: ball.y - origin.y };
+    const b = dot(toball, dir);
+    const c = dot(toball, toball) - (2 * BALL_RADIUS) ** 2;
+    const disc = b * b - c;
+    if (disc < 0) continue;
+    const t = b - Math.sqrt(disc);
+    if (t > 0 && t < closest.dist) {
+      closest = { dist: t, type: 'ball', ball,
+        point: { x: origin.x + t * dir.x, y: origin.y + t * dir.y } };
+    }
+  }
+
+  // 2. Check cushion segments
+  for (const seg of CUSHION_SEGMENTS) {
+    const t = raySegmentIntersect(origin, dir, seg);
+    if (t !== null && t > 0 && t < closest.dist) {
+      closest = { dist: t, type: 'cushion', ball: null,
+        point: { x: origin.x + t * dir.x, y: origin.y + t * dir.y } };
+    }
+  }
+
+  return closest;
+}
+```
+
+Ghost ball position = `closest.point` (that's where cue ball center would be at contact). Object-ball deflection direction = normalized vector from ghost ball center to target ball center. Cue ball deflection direction = perpendicular to that vector (tangent direction, two possible — choose the one forming an acute angle with the shot direction's continuation).
+
+---
+
+## XIV. Rendering Draw Order (Per Frame)
+
+```
+1. Clear canvas
+2. drawWoodRails()          — outer border, brown fill
+3. drawFelt()               — green fill in table bounds
+4. drawCushionStrips()      — darker green inner cushion strips
+5. drawDiamondSights()      — white dots on rails
+6. drawHeadString()         — faint dotted line (optional)
+7. drawFootSpot()           — small dot
+8. drawPocketMouths()       — dark gray rings
+9. drawPockets()            — black circles on top
+10. drawBallShadows()        — all shadow ellipses before any balls
+11. drawBalls()              — all balls (solids, stripes, 8-ball, cue)
+12. if state===AIMING || POWER_DRAG:
+      drawAimingLine()
+      drawGhostBall()
+      drawDeflectionIndicators()
+      drawCueStick()
+13. if state===BALL_IN_HAND_PLACEMENT:
+      drawBallInHandGhost()
+14. if state===SHOT_IN_PROGRESS:
+      drawCueStickStrike()   — strike animation if within 80ms window
+```
+
+Ball shadows drawn in a separate pass (before balls) prevents any ball rendering from overwriting shadows of balls behind them.
+
+---
+
+## XV. Play Again — State Reset Checklist
+
+```js
+function resetGame() {
+  // 1. Alternate breaker
+  gameState.breakingPlayer = opponentOf(gameState.breakingPlayer);
+  gameState.currentPlayer  = gameState.breakingPlayer;
+
+  // 2. Clear all ball state
+  initBalls(); // re-creates all 16 ball objects, positions, zeros velocities
+
+  // 3. Clear game state
+  gameState.groups     = { player1: null, player2: null };
+  gameState.pocketed   = { player1: [], player2: [] };
+  gameState.phase      = 'BREAK'; // within AWAITING_BREAK
+  gameState.state      = 'AWAITING_BREAK';
+  gameState.shotData   = null;
+  gameState.restCounter = 0;
+
+  // 4. Clear HUD
+  uiManager.clearGroupLabels();
+  uiManager.clearPocketedTrays();
+  uiManager.hidePowerMeter();
+  uiManager.hideModal('gameOver');
+
+  // 5. Show start state
+  // No start modal on Play Again — go directly to AIMING
+  gameState.state = 'AIMING';
+}
+```
+
+Do not show the start modal on Play Again. Only show it on the very first page load.
+
+---
+
+## XVI. File Dependency Map
+
+```
+index.html
+  └─ <link> styles.css
+  └─ <script defer> game.js
+       ├─ Section 1:  Constants & Color Maps
+       ├─ Section 2:  Ball & GameState Objects
+       ├─ Section 3:  Physics Engine
+       │    ├─ physicsStep(dt)
+       │    ├─ resolveBallBall(a, b)
+       │    ├─ resolveBallCushion(ball, seg)
+       │    ├─ checkPockets()
+       │    └─ applyFriction()
+       ├─ Section 4:  Rendering
+       │    └─ render() — calls draw* functions in order from §XIV
+       ├─ Section 5:  Input Handler
+       │    ├─ canvas.addEventListener('mousemove', ...)
+       │    ├─ canvas.addEventListener('mousedown', ...)
+       │    ├─ canvas.addEventListener('mouseup', ...)
+       │    └─ screenToTable(clientX, clientY)
+       ├─ Section 6:  Rule Engine
+       │    ├─ evaluateShotResult()   — follows §V order
+       │    ├─ validateBreak()        — §VI
+       │    └─ resolveGroupAssignment() — §XII
+       ├─ Section 7:  UI Manager
+       │    └─ updateHUD(), showFoulBanner(), showModal(), hideModal()
+       ├─ Section 8:  Main Loop
+       │    └─ gameLoop(timestamp) — accumulator pattern, calls physicsStep + render
+       └─ Section 9:  Initialization
+            └─ initGame() → initCanvas() → buildRack() → attachEvents() → gameLoop()
+```
+
+---
+
+This refined plan resolves every structural gap in the original specification. Proceed to implementation with these additions merged into the original spec as authoritative overrides where they conflict, and as extensions where they add.
